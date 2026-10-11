@@ -138,16 +138,17 @@ jobs:
               </application>
           </manifest>
           GLYPH_EOF
-          cat > app/src/main/res/values/styles.xml <<'GLYPH_EOF'
+                    cat > app/src/main/res/values/styles.xml <<'GLYPH_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
 
               <style name="ShowTheme" parent="@android:style/Theme.Translucent.NoTitleBar">
-                  <item name="android:windowNoAnimation">true</item>
+                  <item name="android:windowAnimationStyle">@null</item>
               </style>
           </resources>
           GLYPH_EOF
+          
           cat > app/src/main/java/com/glyphcallart/GlyphController.kt <<'GLYPH_EOF'
           package com.glyphcallart
 
