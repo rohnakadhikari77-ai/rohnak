@@ -1,0 +1,469 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p app/libs app/src/main/java/com/glyphcallart app/src/main/res/values
+          cat > settings.gradle.kts <<'GLYPH_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "GlyphCallArt"
+          include(":app")
+          GLYPH_EOF
+          cat > build.gradle.kts <<'GLYPH_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          GLYPH_EOF
+          cat > gradle.properties <<'GLYPH_EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          GLYPH_EOF
+          cat > app/build.gradle.kts <<'GLYPH_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.glyphcallart"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.glyphcallart"
+                  // Nothing's Glyph SDK works only on Android 14+
+                  minSdk = 34
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              // Official Nothing Glyph SDK (same AAR for Glyph and GlyphMatrix)
+              implementation(files("libs/glyph-matrix-sdk-2.0.aar"))
+          }
+          GLYPH_EOF
+          cat > app/src/main/AndroidManifest.xml <<'GLYPH_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="com.nothing.ketchum.permission.ENABLE" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Glyph Call Art"
+                  android:theme="@style/AppTheme">
+
+                  <!-- "test" key works while Glyph debug mode is on (see README) -->
+                  <meta-data
+                      android:name="NothingKey"
+                      android:value="test" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <!-- Invisible, untouchable activity: it only exists so this app counts as
+                       "foreground" (Nothing's SDK allows only foreground apps) while a call is on. -->
+                  <activity
+                      android:name=".GlyphActivity"
+                      android:exported="false"
+                      android:excludeFromRecents="true"
+                      android:launchMode="singleTask"
+                      android:taskAffinity=""
+                      android:theme="@style/ShowTheme" />
+
+                  <service
+                      android:name=".CallWatcherService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Watches call state to run a Glyph light show" />
+                  </service>
+              </application>
+          </manifest>
+          GLYPH_EOF
+          cat > app/src/main/res/values/styles.xml <<'GLYPH_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+
+              <style name="ShowTheme" parent="@android:style/Theme.Translucent.NoTitleBar">
+                  <item name="android:windowNoAnimation">true</item>
+              </style>
+          </resources>
+          GLYPH_EOF
+          cat > app/src/main/java/com/glyphcallart/GlyphController.kt <<'GLYPH_EOF'
+          package com.glyphcallart
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.util.Log
+          import com.nothing.ketchum.Common
+          import com.nothing.ketchum.Glyph
+          import com.nothing.ketchum.GlyphException
+          import com.nothing.ketchum.GlyphManager
+          import kotlin.random.Random
+
+          enum class Pattern(val label: String) {
+              PULSE("Pulse (saari lights breathe karein)"),
+              CHASE("Chase (ring mein ghoomti light)"),
+              VOICE("Voice bars (awaaz jaisi bars)"),
+              SPARKLE("Sparkle (random chamak)")
+          }
+
+          /**
+           * Plays a light show on the Nothing Phone (3a) Glyph zones:
+           *  A = 11 LEDs (A_1 top ... A_11 bottom), B = 5 LEDs, C = 20 LEDs around the ring.
+           * The SDK only works while this app is in the foreground and Glyph debug mode is on.
+           */
+          class GlyphController(
+              context: Context,
+              private val onStatus: (String) -> Unit = {}
+          ) {
+              private val appContext = context.applicationContext
+              private var manager: GlyphManager? = null
+              private var sessionOpen = false
+              private var wanted: Pattern? = null
+              private var thread: HandlerThread? = null
+              private var handler: Handler? = null
+              @Volatile private var running = false
+              private var step = 0
+              private var levelA = 5
+              private var levelB = 2
+
+              private val callback = object : GlyphManager.Callback {
+                  override fun onServiceConnected(componentName: ComponentName?) {
+                      val gm = manager ?: return
+                      if (!Common.is24111()) {
+                          onStatus("Ye Phone (3a) nahi lag raha, Glyph SDK band hai")
+                          return
+                      }
+                      gm.register(Glyph.DEVICE_24111)
+                      try {
+                          gm.openSession()
+                          sessionOpen = true
+                          onStatus("Glyph connected")
+                          wanted?.let { beginLoop(it) }
+                      } catch (e: GlyphException) {
+                          Log.e(TAG, "openSession failed", e)
+                          onStatus("Glyph session error: ${e.message}. Debug mode on hai?")
+                      }
+                  }
+
+                  override fun onServiceDisconnected(componentName: ComponentName?) {
+                      sessionOpen = false
+                      running = false
+                      onStatus("Glyph disconnect ho gaya")
+                  }
+              }
+
+              fun start(pattern: Pattern) {
+                  wanted = pattern
+                  if (thread == null) {
+                      val t = HandlerThread("glyph-loop")
+                      t.start()
+                      thread = t
+                      handler = Handler(t.looper)
+                  }
+                  if (manager == null) {
+                      onStatus("Glyph se connect ho raha hai...")
+                      val gm = GlyphManager.getInstance(appContext)
+                      manager = gm
+                      gm.init(callback)
+                  } else if (sessionOpen) {
+                      beginLoop(pattern)
+                  }
+              }
+
+              fun stop() {
+                  running = false
+                  wanted = null
+                  val t = thread
+                  val h = handler
+                  val gm = manager
+                  val wasOpen = sessionOpen
+                  thread = null
+                  handler = null
+                  manager = null
+                  sessionOpen = false
+                  h?.removeCallbacksAndMessages(null)
+                  val cleanup = Runnable {
+                      try { gm?.turnOff() } catch (e: Exception) { Log.w(TAG, "turnOff", e) }
+                      try { if (wasOpen) gm?.closeSession() } catch (e: Exception) { Log.w(TAG, "closeSession", e) }
+                      try { gm?.unInit() } catch (e: Exception) { Log.w(TAG, "unInit", e) }
+                      t?.quitSafely()
+                  }
+                  if (h != null) h.post(cleanup) else cleanup.run()
+              }
+
+              private fun beginLoop(pattern: Pattern) {
+                  val h = handler ?: return
+                  h.removeCallbacksAndMessages(null)
+                  running = true
+                  step = 0
+                  h.post(object : Runnable {
+                      override fun run() {
+                          if (!running) return
+                          val delay = try {
+                              tick(pattern)
+                          } catch (e: Exception) {
+                              Log.e(TAG, "tick failed", e)
+                              500L
+                          }
+                          handler?.postDelayed(this, delay)
+                      }
+                  })
+              }
+
+              /** Draws one frame and returns how long to wait before the next one. */
+              private fun tick(pattern: Pattern): Long {
+                  val gm = manager ?: return 200L
+                  return when (pattern) {
+                      Pattern.PULSE -> {
+                          val frame = gm.glyphFrameBuilder
+                              .buildChannelA()
+                              .buildChannelB()
+                              .buildChannelC()
+                              .buildPeriod(1400)
+                              .buildCycles(1)
+                              .buildInterval(10)
+                              .build()
+                          gm.animate(frame)
+                          1500L
+                      }
+                      Pattern.CHASE -> {
+                          val n = C.size
+                          show(gm, intArrayOf(C[step % n], C[(step + 1) % n], C[(step + 2) % n], C[(step + 3) % n]))
+                          step++
+                          60L
+                      }
+                      Pattern.VOICE -> {
+                          levelA = (levelA + Random.nextInt(-4, 5)).coerceIn(0, A.size)
+                          levelB = (levelB + Random.nextInt(-2, 3)).coerceIn(0, B.size)
+                          val lit = ArrayList<Int>()
+                          // bars grow from the bottom (A_11) upwards
+                          for (i in 0 until levelA) lit.add(A[A.size - 1 - i])
+                          for (i in 0 until levelB) lit.add(B[i])
+                          show(gm, lit.toIntArray())
+                          110L
+                      }
+                      Pattern.SPARKLE -> {
+                          val pick = HashSet<Int>()
+                          while (pick.size < 6) pick.add(ALL[Random.nextInt(ALL.size)])
+                          show(gm, pick.toIntArray())
+                          140L
+                      }
+                  }
+              }
+
+              /** Lights exactly these LEDs (toggling a new frame replaces the previous one). */
+              private fun show(gm: GlyphManager, channels: IntArray) {
+                  if (channels.isEmpty()) {
+                      gm.turnOff()
+                      return
+                  }
+                  val builder = gm.glyphFrameBuilder
+                  for (c in channels) builder.buildChannel(c)
+                  gm.toggle(builder.build())
+              }
+
+              companion object {
+                  private const val TAG = "GlyphController"
+
+                  private val A = intArrayOf(
+                      Glyph.Code_24111.A_1, Glyph.Code_24111.A_2, Glyph.Code_24111.A_3,
+                      Glyph.Code_24111.A_4, Glyph.Code_24111.A_5, Glyph.Code_24111.A_6,
+                      Glyph.Code_24111.A_7, Glyph.Code_24111.A_8, Glyph.Code_24111.A_9,
+                      Glyph.Code_24111.A_10, Glyph.Code_24111.A_11
+                  )
+                  private val B = intArrayOf(
+                      Glyph.Code_24111.B_1, Glyph.Code_24111.B_2, Glyph.Code_24111.B_3,
+                      Glyph.Code_24111.B_4, Glyph.Code_24111.B_5
+                  )
+                  private val C = intArrayOf(
+                      Glyph.Code_24111.C_1, Glyph.Code_24111.C_2, Glyph.Code_24111.C_3,
+                      Glyph.Code_24111.C_4, Glyph.Code_24111.C_5, Glyph.Code_24111.C_6,
+                      Glyph.Code_24111.C_7, Glyph.Code_24111.C_8, Glyph.Code_24111.C_9,
+                      Glyph.Code_24111.C_10, Glyph.Code_24111.C_11, Glyph.Code_24111.C_12,
+                      Glyph.Code_24111.C_13, Glyph.Code_24111.C_14, Glyph.Code_24111.C_15,
+                      Glyph.Code_24111.C_16, Glyph.Code_24111.C_17, Glyph.Code_24111.C_18,
+                      Glyph.Code_24111.C_19, Glyph.Code_24111.C_20
+                  )
+                  private val ALL = A + B + C
+              }
+          }
+          GLYPH_EOF
+          cat > app/src/main/java/com/glyphcallart/CallWatcherService.kt <<'GLYPH_EOF'
+          package com.glyphcallart
+
+          import android.Manifest
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.os.IBinder
+          import android.provider.Settings
+          import android.telephony.TelephonyCallback
+          import android.telephony.TelephonyManager
+          import android.util.Log
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+
+          /**
+           * Foreground service that watches the call state. When a call becomes active it opens the
+           * invisible [GlyphActivity] (so the Glyph SDK sees this app as foreground) and posts a
+           * tap-to-start notification as a manual fallback. When the call ends everything is closed.
+           */
+          class CallWatcherService : Service() {
+
+              private var telephony: TelephonyManager? = null
+              private var callback: TelephonyCallback? = null
+              private var overlay: View? = null
+              private var inCall = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createChannels()
+
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val note = Notification.Builder(this, CH_WATCH)
+                      .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+                      .setContentTitle("Glyph Call Art chalu hai")
+                      .setContentText("Call par Glyph animation chalegi")
+                      .setOngoing(true)
+                      .setContentIntent(open)
+                      .build()
+                  startForeground(ID_WATCH, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+
+                  if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+                      Log.w(TAG, "READ_PHONE_STATE not granted, stopping")
+                      stopSelf()
+                      return
+                  }
+                  val tm = getSystemService(TelephonyManager::class.java)
+                  telephony = tm
+                  val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                      override fun onCallStateChanged(state: Int) {
+                          handleState(state)
+                      }
+                  }
+                  callback = cb
+                  tm.registerTelephonyCallback(mainExecutor, cb)
+              }
+
+              override fun onDestroy() {
+                  callback?.let { telephony?.unregisterTelephonyCallback(it) }
+                  callback = null
+                  if (inCall) stopShow()
+                  removeOverlay()
+                  super.onDestroy()
+              }
+
+              private fun handleState(state: Int) {
+                  when (state) {
+                      TelephonyManager.CALL_STATE_OFFHOOK -> if (!inCall) {
+                          inCall = true
+                          startShow()
+                      }
+                      TelephonyManager.CALL_STATE_IDLE -> if (inCall) {
+                          inCall = false
+                          stopShow()
+                      }
+                  }
+              }
+
+              private fun startShow() {
+                  val showIntent = Intent(this, GlyphActivity::class.java)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+
+                  // Manual fallback: tap this notification during the call to start the show.
+                  val tap = PendingIntent.getActivity(this, 1, showIntent, PendingIntent.FLAG_IMMUTABLE)
+                  val note = Notification.Builder(this, CH_SHOW)
+                      .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+                      .setContentTitle("Call chal rahi hai")
+                      .setContentText("Glyph show ke liye yaha tap karo")
+                      .setContentIntent(tap)
+                      .setAutoCancel(true)
+                      .build()
+                  getSystemService(NotificationManager::class.java).notify(ID_SHOW, note)
+
+                  // Auto start: Android allows background activity launches only with a visible overlay.
+                  if (Settings.canDrawOverlays(this)) addOverlay()
+                  try {
+                      startActivity(showIntent)
+                  } catch (e: Exception) {
+                      Log.w(TAG, "auto start blocked", e)
+                  }
+              }
+
+          
