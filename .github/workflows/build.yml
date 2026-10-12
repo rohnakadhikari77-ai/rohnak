@@ -14,753 +14,190 @@ jobs:
       - name: Create project files
         run: |
           set -e
-          mkdir -p app/libs app/src/main/java/com/glyphcallart app/src/main/res/values
-          cat > settings.gradle.kts <<'GLYPH_EOF'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-
-          rootProject.name = "GlyphCallArt"
-          include(":app")
-          GLYPH_EOF
-          cat > build.gradle.kts <<'GLYPH_EOF'
-          plugins {
-              id("com.android.application") version "8.7.3" apply false
-              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
-          }
-          GLYPH_EOF
-          cat > gradle.properties <<'GLYPH_EOF'
-          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
-          android.useAndroidX=false
-          android.nonTransitiveRClass=true
-          kotlin.code.style=official
-          GLYPH_EOF
-          cat > app/build.gradle.kts <<'GLYPH_EOF'
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-          }
-
-          android {
-              namespace = "com.glyphcallart"
-              compileSdk = 35
-
-              defaultConfig {
-                  applicationId = "com.glyphcallart"
-                  // Nothing's Glyph SDK works only on Android 14+
-                  minSdk = 34
-                  targetSdk = 35
-                  versionCode = 1
-                  versionName = "1.0"
-              }
-
-              buildTypes {
-                  release {
-                      isMinifyEnabled = false
-                  }
-              }
-
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-
-              kotlinOptions {
-                  jvmTarget = "17"
-              }
-          }
-
-          dependencies {
-              // Official Nothing Glyph SDK (same AAR for Glyph and GlyphMatrix)
-              implementation(files("libs/glyph-matrix-sdk-2.0.aar"))
-          }
-          GLYPH_EOF
-          cat > app/src/main/AndroidManifest.xml <<'GLYPH_EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-              <uses-permission android:name="com.nothing.ketchum.permission.ENABLE" />
-              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-              <application
-                  android:allowBackup="false"
-                  android:label="Glyph Call Art"
-                  android:theme="@style/AppTheme">
-
-                  <!-- "test" key works while Glyph debug mode is on (see README) -->
-                  <meta-data
-                      android:name="NothingKey"
-                      android:value="test" />
-
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-
-                  <!-- Invisible, untouchable activity: it only exists so this app counts as
-                       "foreground" (Nothing's SDK allows only foreground apps) while a call is on. -->
-                  <activity
-                      android:name=".GlyphActivity"
-                      android:exported="false"
-                      android:excludeFromRecents="true"
-                      android:launchMode="singleTask"
-                      android:taskAffinity=""
-                      android:theme="@style/ShowTheme" />
-
-                  <service
-                      android:name=".CallWatcherService"
-                      android:exported="false"
-                      android:foregroundServiceType="specialUse">
-                      <property
-                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                          android:value="Watches call state to run a Glyph light show" />
-                  </service>
-              </application>
-          </manifest>
-          GLYPH_EOF
-                    cat > app/src/main/res/values/styles.xml <<'GLYPH_EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
-
-              <style name="ShowTheme" parent="@android:style/Theme.Translucent.NoTitleBar">
-                  <item name="android:windowAnimationStyle">@null</item>
-              </style>
-          </resources>
-          GLYPH_EOF
-          
-          cat > app/src/main/java/com/glyphcallart/GlyphController.kt <<'GLYPH_EOF'
-          package com.glyphcallart
-
-          import android.content.ComponentName
-          import android.content.Context
-          import android.os.Handler
-          import android.os.HandlerThread
-          import android.util.Log
-          import com.nothing.ketchum.Common
-          import com.nothing.ketchum.Glyph
-          import com.nothing.ketchum.GlyphException
-          import com.nothing.ketchum.GlyphManager
-          import kotlin.random.Random
-
-          enum class Pattern(val label: String) {
-              PULSE("Pulse (saari lights breathe karein)"),
-              CHASE("Chase (ring mein ghoomti light)"),
-              VOICE("Voice bars (awaaz jaisi bars)"),
-              SPARKLE("Sparkle (random chamak)")
-          }
-
-          /**
-           * Plays a light show on the Nothing Phone (3a) Glyph zones:
-           *  A = 11 LEDs (A_1 top ... A_11 bottom), B = 5 LEDs, C = 20 LEDs around the ring.
-           * The SDK only works while this app is in the foreground and Glyph debug mode is on.
-           */
-          class GlyphController(
-              context: Context,
-              private val onStatus: (String) -> Unit = {}
-          ) {
-              private val appContext = context.applicationContext
-              private var manager: GlyphManager? = null
-              private var sessionOpen = false
-              private var wanted: Pattern? = null
-              private var thread: HandlerThread? = null
-              private var handler: Handler? = null
-              @Volatile private var running = false
-              private var step = 0
-              private var levelA = 5
-              private var levelB = 2
-
-              private val callback = object : GlyphManager.Callback {
-                  override fun onServiceConnected(componentName: ComponentName?) {
-                      val gm = manager ?: return
-                      if (!Common.is24111()) {
-                          onStatus("Ye Phone (3a) nahi lag raha, Glyph SDK band hai")
-                          return
-                      }
-                      gm.register(Glyph.DEVICE_24111)
-                      try {
-                          gm.openSession()
-                          sessionOpen = true
-                          onStatus("Glyph connected")
-                          wanted?.let { beginLoop(it) }
-                      } catch (e: GlyphException) {
-                          Log.e(TAG, "openSession failed", e)
-                          onStatus("Glyph session error: ${e.message}. Debug mode on hai?")
-                      }
-                  }
-
-                  override fun onServiceDisconnected(componentName: ComponentName?) {
-                      sessionOpen = false
-                      running = false
-                      onStatus("Glyph disconnect ho gaya")
-                  }
-              }
-
-              fun start(pattern: Pattern) {
-                  wanted = pattern
-                  if (thread == null) {
-                      val t = HandlerThread("glyph-loop")
-                      t.start()
-                      thread = t
-                      handler = Handler(t.looper)
-                  }
-                  if (manager == null) {
-                      onStatus("Glyph se connect ho raha hai...")
-                      val gm = GlyphManager.getInstance(appContext)
-                      manager = gm
-                      gm.init(callback)
-                  } else if (sessionOpen) {
-                      beginLoop(pattern)
-                  }
-              }
-
-              fun stop() {
-                  running = false
-                  wanted = null
-                  val t = thread
-                  val h = handler
-                  val gm = manager
-                  val wasOpen = sessionOpen
-                  thread = null
-                  handler = null
-                  manager = null
-                  sessionOpen = false
-                  h?.removeCallbacksAndMessages(null)
-                  val cleanup = Runnable {
-                      try { gm?.turnOff() } catch (e: Exception) { Log.w(TAG, "turnOff", e) }
-                      try { if (wasOpen) gm?.closeSession() } catch (e: Exception) { Log.w(TAG, "closeSession", e) }
-                      try { gm?.unInit() } catch (e: Exception) { Log.w(TAG, "unInit", e) }
-                      t?.quitSafely()
-                  }
-                  if (h != null) h.post(cleanup) else cleanup.run()
-              }
-
-              private fun beginLoop(pattern: Pattern) {
-                  val h = handler ?: return
-                  h.removeCallbacksAndMessages(null)
-                  running = true
-                  step = 0
-                  h.post(object : Runnable {
-                      override fun run() {
-                          if (!running) return
-                          val delay = try {
-                              tick(pattern)
-                          } catch (e: Exception) {
-                              Log.e(TAG, "tick failed", e)
-                              500L
-                          }
-                          handler?.postDelayed(this, delay)
-                      }
-                  })
-              }
-
-              /** Draws one frame and returns how long to wait before the next one. */
-              private fun tick(pattern: Pattern): Long {
-                  val gm = manager ?: return 200L
-                  return when (pattern) {
-                      Pattern.PULSE -> {
-                          val frame = gm.glyphFrameBuilder
-                              .buildChannelA()
-                              .buildChannelB()
-                              .buildChannelC()
-                              .buildPeriod(1400)
-                              .buildCycles(1)
-                              .buildInterval(10)
-                              .build()
-                          gm.animate(frame)
-                          1500L
-                      }
-                      Pattern.CHASE -> {
-                          val n = C.size
-                          show(gm, intArrayOf(C[step % n], C[(step + 1) % n], C[(step + 2) % n], C[(step + 3) % n]))
-                          step++
-                          60L
-                      }
-                      Pattern.VOICE -> {
-                          levelA = (levelA + Random.nextInt(-4, 5)).coerceIn(0, A.size)
-                          levelB = (levelB + Random.nextInt(-2, 3)).coerceIn(0, B.size)
-                          val lit = ArrayList<Int>()
-                          // bars grow from the bottom (A_11) upwards
-                          for (i in 0 until levelA) lit.add(A[A.size - 1 - i])
-                          for (i in 0 until levelB) lit.add(B[i])
-                          show(gm, lit.toIntArray())
-                          110L
-                      }
-                      Pattern.SPARKLE -> {
-                          val pick = HashSet<Int>()
-                          while (pick.size < 6) pick.add(ALL[Random.nextInt(ALL.size)])
-                          show(gm, pick.toIntArray())
-                          140L
-                      }
-                  }
-              }
-
-              /** Lights exactly these LEDs (toggling a new frame replaces the previous one). */
-              private fun show(gm: GlyphManager, channels: IntArray) {
-                  if (channels.isEmpty()) {
-                      gm.turnOff()
-                      return
-                  }
-                  val builder = gm.glyphFrameBuilder
-                  for (c in channels) builder.buildChannel(c)
-                  gm.toggle(builder.build())
-              }
-
-              companion object {
-                  private const val TAG = "GlyphController"
-
-                  private val A = intArrayOf(
-                      Glyph.Code_24111.A_1, Glyph.Code_24111.A_2, Glyph.Code_24111.A_3,
-                      Glyph.Code_24111.A_4, Glyph.Code_24111.A_5, Glyph.Code_24111.A_6,
-                      Glyph.Code_24111.A_7, Glyph.Code_24111.A_8, Glyph.Code_24111.A_9,
-                      Glyph.Code_24111.A_10, Glyph.Code_24111.A_11
-                  )
-                  private val B = intArrayOf(
-                      Glyph.Code_24111.B_1, Glyph.Code_24111.B_2, Glyph.Code_24111.B_3,
-                      Glyph.Code_24111.B_4, Glyph.Code_24111.B_5
-                  )
-                  private val C = intArrayOf(
-                      Glyph.Code_24111.C_1, Glyph.Code_24111.C_2, Glyph.Code_24111.C_3,
-                      Glyph.Code_24111.C_4, Glyph.Code_24111.C_5, Glyph.Code_24111.C_6,
-                      Glyph.Code_24111.C_7, Glyph.Code_24111.C_8, Glyph.Code_24111.C_9,
-                      Glyph.Code_24111.C_10, Glyph.Code_24111.C_11, Glyph.Code_24111.C_12,
-                      Glyph.Code_24111.C_13, Glyph.Code_24111.C_14, Glyph.Code_24111.C_15,
-                      Glyph.Code_24111.C_16, Glyph.Code_24111.C_17, Glyph.Code_24111.C_18,
-                      Glyph.Code_24111.C_19, Glyph.Code_24111.C_20
-                  )
-                  private val ALL = A + B + C
-              }
-          }
-          GLYPH_EOF
-          cat > app/src/main/java/com/glyphcallart/CallWatcherService.kt <<'GLYPH_EOF'
-          package com.glyphcallart
-
-          import android.Manifest
-          import android.app.Notification
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.app.PendingIntent
-          import android.app.Service
-          import android.content.Intent
-          import android.content.pm.PackageManager
-          import android.content.pm.ServiceInfo
-          import android.graphics.PixelFormat
-          import android.os.IBinder
-          import android.provider.Settings
-          import android.telephony.TelephonyCallback
-          import android.telephony.TelephonyManager
-          import android.util.Log
-          import android.view.Gravity
-          import android.view.View
-          import android.view.WindowManager
-
-          /**
-           * Foreground service that watches the call state. When a call becomes active it opens the
-           * invisible [GlyphActivity] (so the Glyph SDK sees this app as foreground) and posts a
-           * tap-to-start notification as a manual fallback. When the call ends everything is closed.
-           */
-          class CallWatcherService : Service() {
-
-              private var telephony: TelephonyManager? = null
-              private var callback: TelephonyCallback? = null
-              private var overlay: View? = null
-              private var inCall = false
-
-              override fun onBind(intent: Intent?): IBinder? = null
-
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
-
-              override fun onCreate() {
-                  super.onCreate()
-                  createChannels()
-
-                  val open = PendingIntent.getActivity(
-                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
-                  )
-                  val note = Notification.Builder(this, CH_WATCH)
-                      .setSmallIcon(android.R.drawable.stat_sys_phone_call)
-                      .setContentTitle("Glyph Call Art chalu hai")
-                      .setContentText("Call par Glyph animation chalegi")
-                      .setOngoing(true)
-                      .setContentIntent(open)
-                      .build()
-                  startForeground(ID_WATCH, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-
-                  if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
-                      Log.w(TAG, "READ_PHONE_STATE not granted, stopping")
-                      stopSelf()
-                      return
-                  }
-                  val tm = getSystemService(TelephonyManager::class.java)
-                  telephony = tm
-                  val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
-                      override fun onCallStateChanged(state: Int) {
-                          handleState(state)
-                      }
-                  }
-                  callback = cb
-                  tm.registerTelephonyCallback(mainExecutor, cb)
-              }
-
-              override fun onDestroy() {
-                  callback?.let { telephony?.unregisterTelephonyCallback(it) }
-                  callback = null
-                  if (inCall) stopShow()
-                  removeOverlay()
-                  super.onDestroy()
-              }
-
-              private fun handleState(state: Int) {
-                  when (state) {
-                      TelephonyManager.CALL_STATE_OFFHOOK -> if (!inCall) {
-                          inCall = true
-                          startShow()
-                      }
-                      TelephonyManager.CALL_STATE_IDLE -> if (inCall) {
-                          inCall = false
-                          stopShow()
-                      }
-                  }
-              }
-
-              private fun startShow() {
-                  val showIntent = Intent(this, GlyphActivity::class.java)
-                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
-
-                  // Manual fallback: tap this notification during the call to start the show.
-                  val tap = PendingIntent.getActivity(this, 1, showIntent, PendingIntent.FLAG_IMMUTABLE)
-                  val note = Notification.Builder(this, CH_SHOW)
-                      .setSmallIcon(android.R.drawable.stat_sys_phone_call)
-                      .setContentTitle("Call chal rahi hai")
-                      .setContentText("Glyph show ke liye yaha tap karo")
-                      .setContentIntent(tap)
-                      .setAutoCancel(true)
-                      .build()
-                  getSystemService(NotificationManager::class.java).notify(ID_SHOW, note)
-
-                  // Auto start: Android allows background activity launches only with a visible overlay.
-                  if (Settings.canDrawOverlays(this)) addOverlay()
-                  try {
-                      startActivity(showIntent)
-                  } catch (e: Exception) {
-                      Log.w(TAG, "auto start blocked", e)
-                  }
-              }
-
-              private fun stopShow() {
-                  sendBroadcast(Intent(ACTION_STOP).setPackage(packageName))
-                  getSystemService(NotificationManager::class.java).cancel(ID_SHOW)
-                  removeOverlay()
-              }
-
-              private fun addOverlay() {
-                  if (overlay != null) return
-                  val wm = getSystemService(WindowManager::class.java)
-                  val view = View(this)
-                  val lp = WindowManager.LayoutParams(
-                      1, 1,
-                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-                      PixelFormat.TRANSLUCENT
-                  )
-                  lp.gravity = Gravity.TOP or Gravity.START
-                  try {
-                      wm.addView(view, lp)
-                      overlay = view
-                  } catch (e: Exception) {
-                      Log.w(TAG, "overlay failed", e)
-                  }
-              }
-
-              private fun removeOverlay() {
-                  val v = overlay ?: return
-                  try {
-                      getSystemService(WindowManager::class.java).removeView(v)
-                  } catch (e: Exception) {
-                      Log.w(TAG, "overlay remove failed", e)
-                  }
-                  overlay = null
-              }
-
-              private fun createChannels() {
-                  val nm = getSystemService(NotificationManager::class.java)
-                  nm.createNotificationChannel(
-                      NotificationChannel(CH_WATCH, "Call watcher", NotificationManager.IMPORTANCE_LOW)
-                  )
-                  nm.createNotificationChannel(
-                      NotificationChannel(CH_SHOW, "Glyph show", NotificationManager.IMPORTANCE_HIGH)
-                  )
-              }
-
-              companion object {
-                  private const val TAG = "CallWatcherService"
-                  const val ACTION_STOP = "com.glyphcallart.STOP_SHOW"
-                  private const val CH_WATCH = "watch"
-                  private const val CH_SHOW = "show"
-                  private const val ID_WATCH = 1
-                  private const val ID_SHOW = 2
-              }
-          }
-          GLYPH_EOF
-          cat > app/src/main/java/com/glyphcallart/GlyphActivity.kt <<'GLYPH_EOF'
-          package com.glyphcallart
-
-          import android.Manifest
-          import android.app.Activity
-          import android.content.BroadcastReceiver
-          import android.content.Context
-          import android.content.Intent
-          import android.content.IntentFilter
-          import android.content.pm.PackageManager
-          import android.os.Bundle
-          import android.telephony.TelephonyManager
-          import android.view.WindowManager
-
-          /**
-           * Transparent, untouchable activity. The call screen stays visible and usable underneath;
-           * this activity only keeps the app "foreground" so the Glyph SDK accepts our commands.
-           */
-          class GlyphActivity : Activity() {
-
-              private var controller: GlyphController? = null
-
-              private val stopReceiver = object : BroadcastReceiver() {
-                  override fun onReceive(context: Context?, intent: Intent?) {
-                      finish()
-                  }
-              }
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  window.addFlags(
-                      WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                          WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-                  )
-                  setShowWhenLocked(true)
-                  registerReceiver(
-                      stopReceiver,
-                      IntentFilter(CallWatcherService.ACTION_STOP),
-                      Context.RECEIVER_NOT_EXPORTED
-                  )
-              }
-
-              override fun onResume() {
-                  super.onResume()
-                  if (!callIsActive()) {
-                      finish()
-                      return
-                  }
-                  val saved = getSharedPreferences("glyph", MODE_PRIVATE).getString("pattern", Pattern.VOICE.name)
-                  val pattern = Pattern.values().firstOrNull { it.name == saved } ?: Pattern.VOICE
-                  val c = GlyphController(this)
-                  controller = c
-                  c.start(pattern)
-              }
-
-              override fun onPause() {
-                  controller?.stop()
-                  controller = null
-                  super.onPause()
-              }
-
-              override fun onDestroy() {
-                  try {
-                      unregisterReceiver(stopReceiver)
-                  } catch (e: IllegalArgumentException) {
-                      // already unregistered
-                  }
-                  super.onDestroy()
-              }
-
-              private fun callIsActive(): Boolean {
-                  if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
-                      return true
-                  }
-                  val tm = getSystemService(TelephonyManager::class.java)
-                  return try {
-                      tm.callState != TelephonyManager.CALL_STATE_IDLE
-                  } catch (e: SecurityException) {
-                      true
-                  }
-              }
-          }
-          GLYPH_EOF
-          cat > app/src/main/java/com/glyphcallart/MainActivity.kt <<'GLYPH_EOF'
-          package com.glyphcallart
-
-          import android.Manifest
-          import android.app.Activity
-          import android.content.Intent
-          import android.content.SharedPreferences
-          import android.graphics.Color
-          import android.net.Uri
-          import android.os.Bundle
-          import android.provider.Settings
-          import android.view.View
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.RadioButton
-          import android.widget.RadioGroup
-          import android.widget.ScrollView
-          import android.widget.TextView
-
-          class MainActivity : Activity() {
-
-              private lateinit var prefs: SharedPreferences
-              private lateinit var statusView: TextView
-              private lateinit var testButton: Button
-              private var controller: GlyphController? = null
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  prefs = getSharedPreferences("glyph", MODE_PRIVATE)
-
-                  val pad = (16 * resources.displayMetrics.density).toInt()
-                  val scroll = ScrollView(this)
-                  scroll.setBackgroundColor(Color.BLACK)
-                  val col = LinearLayout(this)
-                  col.orientation = LinearLayout.VERTICAL
-                  col.setPadding(pad, pad * 2, pad, pad)
-                  scroll.addView(col)
-
-                  fun label(s: String, size: Float): TextView {
-                      val t = TextView(this)
-                      t.text = s
-                      t.textSize = size
-                      t.setTextColor(Color.WHITE)
-                      t.setPadding(0, pad / 2, 0, pad / 2)
-                      return t
-                  }
-
-                  fun button(s: String, onClick: () -> Unit): Button {
-                      val b = Button(this)
-                      b.text = s
-                      b.isAllCaps = false
-                      b.setOnClickListener { onClick() }
-                      return b
-                  }
-
-                  col.addView(label("Glyph Call Art", 26f))
-                  col.addView(
-                      label(
-                          "Pehle ek baar ye adb command chalao (har 48 ghante mein dobara):\n" +
-                              "adb shell settings put global nt_glyph_interface_debug_enable 1",
-                          13f
-                      )
-                  )
-
-                  col.addView(button("1. Permissions do (phone state + notification)") {
-                      requestPermissions(
-                          arrayOf(Manifest.permission.READ_PHONE_STATE, Manifest.permission.POST_NOTIFICATIONS),
-                          REQ_PERMS
-                      )
-                  })
-                  col.addView(button("2. Overlay permission (call par auto start ke liye)") {
-                      startActivity(
-                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-                      )
-                  })
-
-                  col.addView(label("Pattern chuno", 16f))
-                  val group = RadioGroup(this)
-                  val selected = selectedPattern()
-                  for (p in Pattern.values()) {
-                      val rb = RadioButton(this)
-                      rb.id = View.generateViewId()
-                      rb.text = p.label
-                      rb.tag = p.name
-                      rb.setTextColor(Color.WHITE)
-                      group.addView(rb)
-                      if (p == selected) rb.isChecked = true
-                  }
-                  group.setOnCheckedChangeListener { g, checkedId ->
-                      val name = g.findViewById<View>(checkedId)?.tag as? String ?: return@setOnCheckedChangeListener
-                      prefs.edit().putString("pattern", name).apply()
-                      if (controller != null) {
-                          stopTest()
-                          startTest()
-                      }
-                  }
-                  col.addView(group)
-
-                  testButton = button("3. Test: Glyph chalao") {
-                      if (controller == null) startTest() else stopTest()
-                  }
-                  col.addView(testButton)
-
-                  col.addView(button("4. Call watcher START") {
-                      startForegroundService(Intent(this, CallWatcherService::class.java))
-                      setStatus("Call watcher chalu. Ab kisi ko call karo.")
-                  })
-                  col.addView(button("Call watcher STOP") {
-                      stopService(Intent(this, CallWatcherService::class.java))
-                      setStatus("Call watcher band")
-                  })
-
-                  statusView = label("", 14f)
-                  col.addView(statusView)
-
-                  setContentView(scroll)
-              }
-
-              override fun onPause() {
-                  // Glyph SDK works only in foreground, so the test stops when the app goes away.
-                  stopTest()
-                  super.onPause()
-              }
-
-              private fun selectedPattern(): Pattern {
-                  val saved = prefs.getString("pattern", Pattern.VOICE.name)
-                  return Pattern.values().firstOrNull { it.name == saved } ?: Pattern.VOICE
-              }
-
-              private fun startTest() {
-                  val c = GlyphController(this) { msg -> setStatus(msg) }
-                  controller = c
-                  c.start(selectedPattern())
-                  testButton.text = "3. Test: Glyph roko"
-              }
-
-              private fun stopTest() {
-                  controller?.stop()
-                  controller = null
-                  if (::testButton.isInitialized) testButton.text = "3. Test: Glyph chalao"
-              }
-
-              private fun setStatus(msg: String) {
-                  runOnUiThread {
-                      if (::statusView.isInitialized) statusView.text = msg
-                  }
-              }
-
-              companion object {
-                  private const val REQ_PERMS = 10
-              }
-          }
-          GLYPH_EOF
+          mkdir -p app/libs
+          base64 -d <<'GLYPH_B64' | tar xJ
+          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
+          GLYPH_B64
           git clone --depth 1 https://github.com/Nothing-Developer-Programme/Glyph-Developer-Kit.git "$RUNNER_TEMP/gdk"
           cp "$RUNNER_TEMP/gdk/sdk/glyph-matrix-sdk-2.0.aar" app/libs/
+          mkdir -p ~/.android
+          base64 -d <<'GLYPH_KS' > ~/.android/debug.keystore
+          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
+          GLYPH_KS
+          test -f app/src/main/java/com/glyphcallart/Pattern.kt
 
       - uses: actions/setup-java@v4
         with:
